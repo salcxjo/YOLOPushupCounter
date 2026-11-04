@@ -1,0 +1,9 @@
+[project]
+name = "your-project-name"
+version = "0.1.0"
+description = "My Python Project Info"
+dependencies = [
+    "requests==2.31.0",
+    "numpy==1.26.4"
+
+]
