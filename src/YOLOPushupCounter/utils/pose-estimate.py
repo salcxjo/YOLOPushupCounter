@@ -1,76 +1,112 @@
-import threading
+import time
+from collections import deque
+from pathlib import Path
+
 import cv2
 from ultralytics import YOLO
-from zmq.green import device
-import torch
-torch.cuda.is_available()
 
-# 1. Load the lightweight YOLOv8 Nano Pose model
-# (Automatically downloads on first run)
-model = YOLO("yolo26m-pose.pt")
+# ---- config: change these between runs ----
+MODEL_PATH = "yolo26n-pose.pt"   # or "yolo26n-pose_openvino_model/"
+IMGSZ = 320
+SKIP = 1             # process every Nth frame
+DEVICE = 0           # use "cpu" for OpenVINO exports
+WARMUP = 10          # processed frames to ignore in the stats
+MAX_PROCESSED = 200  # only used when display is off
 
+model = YOLO(MODEL_PATH)
 
-# 2. Optimized Camera Class using Multi-Threading
-# This prevents the video from lagging behind real life
-class WebcamStream:
-    def __init__(self, src=0):
-        self.stream = cv2.VideoCapture(src,cv2.CAP_DSHOW)
-        # Force a lower resolution to massively boost processing speed
-        self.stream.set(cv2.CAP_PROP_FRAME_WIDTH, 480)
-        self.stream.set(cv2.CAP_PROP_FRAME_HEIGHT, 360)
+# ---- pick source ----
+choice = input("0 for webcam, 1 for list of videos in train folder\n")
+if choice == "0":
+    cap = cv2.VideoCapture(0)
+else:
+    videos = sorted(p for p in (Path.cwd() / "train-videos").iterdir() if p.is_file())
+    for i, v in enumerate(videos, start=1):
+        print(i, v.name)
+    cap = cv2.VideoCapture(str(videos[int(input("Which video do you want?\n")) - 1]))
 
-        (self.grabbed, self.frame) = self.stream.read()
-        self.stopped = False
+show = input("Display on? (y/n)\n").strip().lower() == "y"
 
-    def start(self):
-        threading.Thread(target=self.update, args=(), daemon=True).start()
-        return self
+if show:
+    cv2.namedWindow("YOLO Pose", cv2.WINDOW_NORMAL)
+    cv2.resizeWindow("YOLO Pose", 960, 540)
 
-    def update(self):
-        while not self.stopped:
-            if not self.grabbed:
-                self.stop()
-                break
-            (self.grabbed, self.frame) = self.stream.read()
+# ---- measurement state ----
+gaps = deque(maxlen=30)  # seconds between processed frames
+stats = {k: [] for k in ("read", "pre", "infer", "post", "plot", "show")}
+frame_idx = 0
+processed = 0
+last_done = None
+t_measure_start = None
+read_start = time.perf_counter()
 
-    def read(self):
-        return self.frame
+while cap.isOpened():
+    # grab() advances without decoding, so skipped frames are cheap
+    if not cap.grab():
+        break
+    frame_idx += 1
+    if frame_idx % SKIP != 0:
+        continue
+    ok, frame = cap.retrieve()  # decode only the frames we keep
+    if not ok:
+        break
+    read_ms = (time.perf_counter() - read_start) * 1000  # includes skipped grabs
 
-    def stop(self):
-        self.stopped = True
-        self.stream.release()
+    # rolling FPS from the gap between processed frames
+    now = time.perf_counter()
+    if last_done is not None:
+        gaps.append(now - last_done)
+    last_done = now
+    fps = len(gaps) / sum(gaps) if gaps else 0.0
 
+    results = model.predict(frame, imgsz=IMGSZ, device=DEVICE, half=True, verbose=False)
+    sp = results[0].speed  # ms: preprocess, inference, postprocess
 
-# Initialize and start the background thread for the camera
-video_feed = WebcamStream(src=0).start()
-print("Starting pose tracking... Press 'q' to quit.")
+    plot_ms = show_ms = 0.0
+    key = -1
+    if show:
+        t = time.perf_counter()
+        annotated = results[0].plot()
+        cv2.putText(annotated, f"{fps:.1f} FPS", (10, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+        plot_ms = (time.perf_counter() - t) * 1000
 
-while True:
-    frame = video_feed.read()
-    if frame is None:
+        t = time.perf_counter()
+        cv2.imshow("YOLO Pose", annotated)
+        key = cv2.waitKey(1) & 0xFF
+        show_ms = (time.perf_counter() - t) * 1000
+
+    processed += 1
+    if processed == WARMUP:
+        t_measure_start = time.perf_counter()
+    if processed > WARMUP:
+        stats["read"].append(read_ms)
+        stats["pre"].append(sp["preprocess"])
+        stats["infer"].append(sp["inference"])
+        stats["post"].append(sp["postprocess"])
+        stats["plot"].append(plot_ms)
+        stats["show"].append(show_ms)
+
+    if show and key == ord("q"):
+        break
+    if not show and processed >= MAX_PROCESSED:
         break
 
-    # 3. Track poses with the tracking engine enabled
-    # persist=True maintains person IDs across frames
-    # verbose=False stops heavy print statements from slowing down the loop
-    results = model.track(frame, stream=True, persist=True, verbose=False)
+    read_start = time.perf_counter()  # restart the read timer
 
-    # 4. Render the skeletons and bounding boxes
-    annotated_frame = frame.copy()
-    for result in results:
-        annotated_frame = result.plot()
-
-        # OPTIONAL: Access raw keypoint coordinates for your custom logic
-        if result.keypoints is not None:
-            # keypoints.xy contains [x, y] coordinates for all 17 human joints
-            xy_coordinates = result.keypoints.xy.cpu().numpy()
-            # print(xy_coordinates) # Uncomment to see the raw array data
-
-    # 5. Display the feed
-    cv2.imshow("YOLO Live Pose Tracking", annotated_frame)
-
-    if cv2.waitKey(1) & 0xFF == ord("q"):
-        break
-
-video_feed.stop()
+cap.release()
 cv2.destroyAllWindows()
+
+# ---- summary ----
+n = len(stats["infer"])
+if n:
+    elapsed = time.perf_counter() - t_measure_start
+    print(f"\nconfig: imgsz={IMGSZ} skip={SKIP} model={MODEL_PATH} display={show}")
+    print(f"measured frames: {n}")
+    print(f"end-to-end processing FPS: {n / elapsed:.1f}")
+    for k, v in stats.items():
+        print(f"{k:>6}: {sum(v) / len(v):7.2f} ms")
+    model_ms = (sum(stats["pre"]) + sum(stats["infer"]) + sum(stats["post"])) / n
+    print(f"model-only ceiling: {1000 / model_ms:.1f} FPS")
+else:
+    print("Not enough frames to measure (need more than WARMUP).")
